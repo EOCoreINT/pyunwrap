@@ -1,0 +1,116 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyunwrap"
+version = "0.1.0"
+description = "AI-driven InSAR phase unwrapping via a Physics-Informed U-Net (Ambiguity-Net) that predicts the discrete integer ambiguity map, enforcing the rewrapping constraint by construction."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "you@example.com" }
+]
+keywords = [
+    "InSAR",
+    "phase-unwrapping",
+    "SAR",
+    "remote-sensing",
+    "deep-learning",
+    "earth-observation",
+    "geospatial",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch>=2.1",
+    "rasterio>=1.3",
+    "geopandas>=0.14",
+    "numpy>=1.24",
+    "scikit-image>=0.22",
+    "scikit-learn>=1.3",
+    "shap>=0.44",
+    "plotly>=5.18",
+    "pyvista>=0.43",
+    "jinja2>=3.1",
+    "onnxruntime>=1.16",
+    "scipy>=1.11",
+    "tqdm>=4.66",
+    "pandas>=2.1",
+    "tensorboard>=2.15",
+    "h5py>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "black>=23.12",
+    "ruff>=0.1.9",
+    "mypy>=1.7",
+]
+maps = [
+    "folium>=0.15",
+    "leafmap>=0.30",
+]
+deploy = [
+    "openvino>=2023.2",
+    "onnx>=1.16",
+    "onnxconverter-common>=1.14",
+    "onnxscript>=0.1",  # required by torch>=2.9's default (dynamo) ONNX exporter
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/pyunwrap"
+Repository = "https://github.com/yourusername/pyunwrap"
+Issues = "https://github.com/yourusername/pyunwrap/issues"
+
+[project.scripts]
+pyunwrap-train = "pyunwrap.training.trainer:main"
+
+[tool.setuptools.packages.find]
+include = ["pyunwrap*"]
+exclude = ["tests*", "docs*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow integration tests (deselect with '-m \"not slow\"')",
+]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# BLE001 (blind `except Exception`) and S110 (bare except-pass) are disabled
+# project-wide: pyunwrap deliberately uses broad exception handling in several
+# well-documented places where failure must degrade gracefully rather than
+# propagate -- e.g. the ONNX/OpenVINO backend fallback chain
+# (utils/deployment.py), best-effort HTML report generation that must never
+# take down a production inference call (inference/unwrapper.py,
+# analytics/report_generator.py), optional ImageNet-pretrained-weight
+# download (models/ambiguity_net.py), and a destructor's best-effort file
+# handle cleanup (data/dataloader.py). Each site already documents its
+# rationale in a comment/docstring at the point of use.
+ignore = ["BLE001", "S110"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
