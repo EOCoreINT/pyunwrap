@@ -31,7 +31,7 @@ being refined.
 
 ---
 
-`pyunwrap` unwraps Interferometric Synthetic Aperture Radar (InSAR) phase — the
+`pyunwrap-insar` unwraps Interferometric Synthetic Aperture Radar (InSAR) phase — the
 core measurement behind satellite-based ground-deformation monitoring — using a
 **physics-informed U-Net that predicts an integer ambiguity map**, not the
 unwrapped phase itself. The rewrapping identity is enforced by construction,
@@ -273,7 +273,7 @@ If `pyunwrap` is useful in your research, please cite it:
   title  = {pyunwrap: Physics-Informed Deep Learning for InSAR Phase Unwrapping},
   author = {{pyunwrap contributors}},
   year   = {2026},
-  url    = {https://github.com/yourusername/pyunwrap},
+  url    = {https://doi.org/10.5281/zenodo.22209219},
   note   = {Version 0.1.0}
 }
 ```

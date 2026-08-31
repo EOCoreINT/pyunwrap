@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pyunwrap"
+name = "pyunwrap-insar"
 version = "0.1.0"
 description = "AI-driven InSAR phase unwrapping via a Physics-Informed U-Net (Ambiguity-Net) that predicts the discrete integer ambiguity map, enforcing the rewrapping constraint by construction."
 readme = "README.md"

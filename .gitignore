@@ -12,7 +12,7 @@ dist/
 .venv/
 venv/
 env/
-
+RELEASE_NOTES_v0.1.0.md/
 # --- Testing / coverage / linting ---
 .pytest_cache/
 .ruff_cache/
