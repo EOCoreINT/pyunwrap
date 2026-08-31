@@ -33,6 +33,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+COMMIT_MSG.txt/
 
 # --- pyunwrap-specific artifacts ---
 # Trained model weights, ONNX exports, and the local Zenodo weight cache

@@ -1,0 +1,110 @@
+Initial implementation: physics-informed InSAR phase unwrapping package
+
+Adds pyunwrap end to end: a synthetic InSAR data generator, a
+physics-informed U-Net (AmbiguityNet) that predicts the integer phase
+ambiguity map instead of regressing phase directly, curriculum training,
+tiled production inference with smart ambiguity-map merging, scientific
+analytics and explainability, interactive visualization and automated
+HTML reporting, a full pytest suite, CI, and example notebooks.
+
+The core design decision this package is built around: AmbiguityNet
+predicts the integer ambiguity k, then reconstructs phase as
+wrapped_phase + 2*pi*k. Because that identity is enforced by
+construction (via a straight-through rounding estimator), the model is
+structurally incapable of producing an output that contradicts the
+observed wrapped phase -- it can only be wrong about how many 2*pi
+cycles were missed, never about the physics of wrapping itself. This
+invariant is threaded through every subsystem below.
+
+Synthetic data (pyunwrap/synthetic/):
+- Gaussian subsidence bowl, a from-scratch Okada (1985) rectangular
+  fault dislocation model, a Mogi (1958) volcanic point source, DEM
+  topographic phase, Kolmogorov-spectrum atmospheric noise, orbital
+  ramps, coherence-dependent decorrelation noise, and a pseudo-real
+  strategy that rewraps real L-band (ALOS-2) phase into simulated
+  C-band data.
+- Ground-truth ambiguity is computed against the actual noisy observed
+  phase (what gets wrapped), not a noise-free signal -- unwrapping
+  resolves 2*pi ambiguity, it does not denoise.
+
+Data pipeline (pyunwrap/data/):
+- Full-coverage sliding-window tiling, robust percentile-based
+  amplitude normalization, HDF5/npz tile persistence.
+- InSARTileDataset applies 8-fold dihedral augmentation and recomputes
+  the integer ambiguity map from the jointly-transformed wrapped/
+  unwrapped pair after every transform, rather than transforming a
+  cached value, so it stays exact at the +-pi wrap boundary.
+
+Model (pyunwrap/models/):
+- AmbiguityNet: ResNet-34-encoder U-Net, dual head (integer ambiguity
+  via straight-through estimator + auxiliary residue-probability map).
+- PhysicsInformedUnwrapLoss: 4-component loss (ambiguity MSE, re-wrap
+  consistency, coherence-weighted smoothness, ambiguity-map Laplacian
+  residue penalty). Two of the four components are architecturally
+  near-trivial by construction; this is documented explicitly in the
+  module docstring rather than left to be mistaken for a bug.
+
+Training (pyunwrap/training/):
+- 3-stage curriculum learning (easy/moderate/full difficulty),
+  optional SNAPHU pseudo-ground-truth fine-tuning, AdamW with warmup +
+  cosine annealing, gradient clipping, TensorBoard logging, and a
+  Visualizer for training curves and phase comparison plots.
+- Curriculum difficulty filtering uses a 99th-percentile gradient
+  threshold rather than a hard max, since ground-truth phase
+  legitimately contains spatially-uncorrelated decorrelation noise that
+  a hard max would otherwise misclassify as universally "hard."
+
+Inference & deployment (pyunwrap/inference/, pyunwrap/utils/):
+- PhaseUnwrapper: tiled inference with edge-aware, residue-probability-
+  weighted smart merging of the integer ambiguity map (never the phase
+  directly), Monte Carlo Dropout uncertainty, and single-file ONNX
+  export with an ONNX Runtime -> OpenVINO backend fallback chain.
+- The edge-aware taper is a deliberate fix: a plain Hanning window
+  zeroes every tile edge, including the true outer boundary of the
+  scene where no neighboring tile exists to pick up the lost weight;
+  the taper here only feathers edges that actually border another tile.
+
+Analytics & reporting (pyunwrap/analytics/, pyunwrap/visualization/):
+- Goldstein-style residue detection and clustering, Nyquist gradient-
+  violation mapping, error-distribution statistics, Grad-CAM and
+  Integrated Gradients explainability, uncertainty-calibration
+  reliability diagrams.
+- Interactive Plotly 3D phase surfaces/heatmaps, a folium swipe-
+  comparison map, and a self-contained Jinja2 HTML report tying every
+  stage together, wrapped in best-effort error handling so a reporting
+  failure never takes down a production inference call.
+
+Tests & CI (tests/, .github/):
+- 65 tests: known-answer physics tests (residue detection checked
+  against a hand-constructed phase vortex with an exact, known
+  topological charge), model/loss correctness, and a tile-merging
+  regression test asserting tiled-and-merged inference is numerically
+  identical to a whole-image pass -- a direct regression test for the
+  Hanning-boundary bug found during development.
+- GitHub Actions: a fast-test matrix (Python 3.10-3.12), a separate
+  slow/integration job, and a ruff/black lint job.
+
+Notebooks (notebooks/):
+- 01_training_pipeline.ipynb and 02_full_pipeline.ipynb, both checked
+  in pre-executed with real outputs against real synthetic data and
+  real file I/O. Fixed a real portability bug along the way: Trainer
+  and pyunwrap.visualization.maps were calling matplotlib.use("Agg")
+  to save plots, which is a global process-wide side effect that
+  silently broke inline plot rendering in any notebook session that
+  called Trainer.fit() and then tried to plt.show() afterward. Removed
+  the forced backend switch; notebooks now call %matplotlib inline
+  explicitly instead, which is robust across Jupyter frontends.
+
+Docs & branding (README.md, docs/, assets/, CONTRIBUTING.md,
+CHANGELOG.md, LICENSE):
+- MIT license, architecture reference, contribution guide, changelog.
+- A logo built as a mathematically-computed Archimedean spiral that
+  unwinds into a straight ascending line -- the literal geophysical
+  metaphor for phase unwrapping -- colored with the same cyclic
+  wrapped-phase palette used throughout the package's own plots.
+  Light/dark-mode-aware via GitHub's prefers-color-scheme support.
+
+Known limitations, documented rather than hidden: no pretrained
+weights ship yet (from_pretrained() requires a Zenodo record the
+caller supplies); Monte Carlo Dropout uncertainty is currently a no-op
+since AmbiguityNet has no nn.Dropout layers yet, only BatchNorm.
