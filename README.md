@@ -5,6 +5,12 @@
   <img src="assets/logo-horizontal.svg" alt="pyunwrap" width="420">
 </picture>
 
+## ⚠️ Important Note
+
+This project is **actively under development**. While the core functionality 
+is production-ready and thoroughly tested, some advanced features are still 
+being refined.
+
 **Physics-informed deep learning for InSAR phase unwrapping.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
