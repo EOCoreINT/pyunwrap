@@ -271,7 +271,7 @@ If `pyunwrap` is useful in your research, please cite it:
 ```bibtex
 @software{pyunwrap2026,
   title  = {pyunwrap: Physics-Informed Deep Learning for InSAR Phase Unwrapping},
-  author = {{pyunwrap contributors}},
+  author = {{Samuel Appiah Kubi}},
   year   = {2026},
   url    = {https://doi.org/10.5281/zenodo.22209219},
   note   = {Version 0.1.0}
