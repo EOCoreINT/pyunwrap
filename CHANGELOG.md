@@ -87,5 +87,5 @@ once it reaches `1.0`.
   `PhaseUnwrapper.unwrap`, since the exported graph's shape-mismatch safety
   net is a data-dependent branch that isn't captured for tile sizes not
   divisible by the encoder's stride.
-- Report generator: the "Training history" section's chart asset was being
+- Report generator: the  "Training history" section's chart asset was being
   generated but never actually embedded in the report template.
