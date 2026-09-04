@@ -8,7 +8,7 @@ improvements.
 ## Getting started
 
 ```bash
-git clone https://github.com/yourusername/pyunwrap.git
+git clone https://github.com/EOCoreINT/pyunwrap.git
 cd pyunwrap
 pip install -e ".[dev,maps,deploy]"
 ```
