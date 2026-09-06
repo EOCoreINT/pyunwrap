@@ -114,7 +114,7 @@ def export_to_onnx(
 
     torch.onnx.export(
         wrapped,
-        dummy_input,
+        dummy_input,  # type: ignore[arg-type]  # torch.onnx.export accepts a single Tensor at runtime; its stub is overly narrow (tuple-only)
         str(output_path),
         input_names=["input"],
         output_names=["k_hat", "k_continuous", "residue_prob", "phi_hat"],
@@ -355,10 +355,14 @@ class InferenceEngine:
         """
         x = x.astype(np.float32)
         if self.backend.startswith("onnxruntime"):
+            assert self._session is not None, "onnxruntime backend requires self._session to be set"
             input_name = self._session.get_inputs()[0].name
             outputs = self._session.run(None, {input_name: x})
             return outputs
         elif self.backend == "openvino-cpu":
+            assert (
+                self._ov_compiled is not None
+            ), "openvino backend requires self._ov_compiled to be set"
             result = self._ov_compiled(x)
             # OpenVINO returns an ordered mapping keyed by output tensors;
             # rely on declaration order, matching the ONNX export's

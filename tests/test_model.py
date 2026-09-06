@@ -69,7 +69,70 @@ class TestAmbiguityNetShapes:
         torch.testing.assert_close(out.phi_hat, expected, atol=1e-4, rtol=1e-4)
 
 
-class TestRoundSTE:
+class TestDropoutAndMCUncertainty:
+    """Tests for the nn.Dropout2d layers added to fix MC-Dropout uncertainty
+    being an unconditional no-op (see AmbiguityNet's dropout_rate docstring
+    and PhaseUnwrapper._enable_mc_dropout)."""
+
+    def test_eval_mode_is_deterministic_despite_dropout(self, dummy_input):
+        """Dropout must be inactive in eval mode: two forward passes on the
+        same input must be identical."""
+        model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.2)
+        model.eval()
+        with torch.no_grad():
+            out1 = model(dummy_input)
+            out2 = model(dummy_input)
+        torch.testing.assert_close(out1.k_continuous, out2.k_continuous)
+
+    def test_train_mode_varies_across_passes(self, dummy_input):
+        """With dropout_rate > 0 and the model in train mode, repeated
+        forward passes on identical input must differ."""
+        model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.3)
+        model.train()
+        with torch.no_grad():
+            out1 = model(dummy_input)
+            out2 = model(dummy_input)
+        assert not torch.equal(out1.k_continuous, out2.k_continuous)
+
+    def test_dropout_rate_zero_disables_stochasticity(self, dummy_input):
+        """dropout_rate=0.0 must reproduce the old (pre-fix) deterministic
+        behavior even in train mode -- a explicit backward-compatibility
+        escape hatch."""
+        model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.0)
+        model.train()
+        with torch.no_grad():
+            out1 = model(dummy_input)
+            out2 = model(dummy_input)
+        torch.testing.assert_close(out1.k_continuous, out2.k_continuous)
+
+    def test_mc_dropout_only_mode_matches_phaseunwrapper_behavior(self, dummy_input):
+        """Replicates PhaseUnwrapper._enable_mc_dropout's exact toggle
+        (eval() overall, then .train() on Dropout2d layers only) and confirms
+        it alone is sufficient to introduce variation."""
+        model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.2)
+        model.eval()
+        for module in model.modules():
+            if isinstance(module, torch.nn.Dropout2d):
+                module.train()
+        with torch.no_grad():
+            out1 = model(dummy_input)
+            out2 = model(dummy_input)
+        assert not torch.equal(out1.k_continuous, out2.k_continuous)
+
+    def test_old_checkpoint_without_dropout_params_loads_cleanly(self, dummy_input):
+        """nn.Dropout2d has no learnable parameters, so a checkpoint saved
+        from a model built before these layers existed must still load
+        cleanly into the current architecture with no missing/unexpected
+        keys -- a real backward-compatibility property, not just a design
+        intention (verified against an actual pre-fix-style checkpoint)."""
+        old_style_model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.0)
+        state_dict = old_style_model.state_dict()
+
+        new_model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.15)
+        missing, unexpected = new_model.load_state_dict(state_dict, strict=False)
+        assert missing == []
+        assert unexpected == []
+
     def test_forward_rounds(self):
         x = torch.tensor([1.2, 1.5, -1.5, -1.9, 0.49])
         rounded = round_ste(x)

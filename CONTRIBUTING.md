@@ -8,7 +8,7 @@ improvements.
 ## Getting started
 
 ```bash
-git clone https://github.com/yourusername/pyunwrap.git
+git clone https://github.com/EOCoreINT/pyunwrap.git
 cd pyunwrap
 pip install -e ".[dev,maps,deploy]"
 ```
@@ -62,8 +62,22 @@ for the specific, documented sites) -- please follow the same pattern
 (document *why* at the call site) if you add a new one, rather than
 suppressing it ad hoc.
 
-Type hints are expected on new public functions; `mypy` is configured in
-`pyproject.toml` but not yet enforced in CI as a hard gate.
+Type hints are expected on new public functions; `mypy` runs as a hard gate
+in CI (`mypy pyunwrap --config-file pyproject.toml`). It's configured with
+`warn_return_any = false`, since numpy/torch's type stubs frequently type
+common operations as returning `Any` even when the real runtime type is
+exactly what the function signature declares -- verified case by case before
+disabling that check project-wide rather than scattering
+`# type: ignore[no-any-return]` everywhere for no functional benefit. Two
+call sites use a precise, commented `# type: ignore[arg-type]` for the same
+reason (`numpy.savez_compressed`'s `**kwargs` typing and
+`torch.onnx.export`'s overly-narrow `args` parameter type) -- genuine type
+errors (wrong argument types, missing `None` checks, etc.) are still caught.
+If you introduce a new `Optional`/`None`-typed attribute that's guaranteed
+non-`None` by construction in some code paths, add an explicit
+`assert x is not None, "..."` at the point of use (see
+`pyunwrap/inference/unwrapper.py`'s `self.model`/`self.engine` for the
+pattern) rather than an unchecked cast or a blanket ignore.
 
 ## Design principles to keep in mind
 

@@ -2,7 +2,8 @@
 
 This document gives a module-by-module overview of the package and how data
 flows through it. For installation and a quick example, see the top-level
-[README](../README.md).
+[README](https://github.com/EOCoreINT/pyunwrap#readme) (or
+{doc}`quickstart` if you're reading this on the documentation site).
 
 ## Data flow
 

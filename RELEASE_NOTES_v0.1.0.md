@@ -1,4 +1,4 @@
-# pyunwrap v0.1.0 — Initial Release
+# pyunwrap v0.1.1 — Initial Release
 
 `pyunwrap` unwraps InSAR phase using a physics-informed U-Net that predicts
 the **integer ambiguity map** rather than the unwrapped phase itself. The
@@ -122,4 +122,4 @@ Mogi (1958). Full citations in the [README](README.md#references).
 See [`CHANGELOG.md`](CHANGELOG.md) for the complete, itemized history,
 including every bug found and fixed during development.
 
-**Full diff**: https://github.com/EOCoreINT/pyunwrap/commits/v0.1.0
+**Full diff**: https://github.com/EOCoreINT/pyunwrap/commits/v0.1.1

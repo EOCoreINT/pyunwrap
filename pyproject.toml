@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyunwrap-insar"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI-driven InSAR phase unwrapping via a Physics-Informed U-Net (Ambiguity-Net) that predicts the discrete integer ambiguity map, enforcing the rewrapping constraint by construction."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Your Name", email = "you@example.com" }
+    { name = "Samuel Appiah Kubi" }
 ]
 keywords = [
     "InSAR",
@@ -69,14 +69,36 @@ deploy = [
     "onnxconverter-common>=1.14",
     "onnxscript>=0.1",  # required by torch>=2.9's default (dynamo) ONNX exporter
 ]
+notebooks = [
+    "jupyter>=1.0",
+    "ipykernel>=6.29",
+]
+snaphu = [
+    "snaphu>=0.4.0",  # official isce-framework Python bindings; bundles its
+    # own compiled SNAPHU binary, no separate system package needed. Powers
+    # pyunwrap.utils.snaphu_integration, which builds the pseudo-ground-truth
+    # fine-tuning datasets Trainer's finetune_dataset expects.
+]
+docs = [
+    "sphinx>=7.0",
+    "furo>=2024.1.0",
+    "myst-parser>=2.0",
+    "sphinx-copybutton>=0.5",
+    "sphinx-autodoc-typehints>=1.25",
+    "sphinx-design>=0.5",
+    "nbsphinx>=0.9",  # renders the pre-executed example notebooks; requires
+    # a system 'pandoc' install (not a pip package) -- see .readthedocs.yaml's
+    # apt_packages for the hosted build, or `apt install pandoc` locally.
+]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/pyunwrap"
-Repository = "https://github.com/yourusername/pyunwrap"
-Issues = "https://github.com/yourusername/pyunwrap/issues"
+Homepage = "https://github.com/EOCoreINT/pyunwrap"
+Repository = "https://github.com/EOCoreINT/pyunwrap"
+Issues = "https://github.com/EOCoreINT/pyunwrap/issues"
 
 [project.scripts]
 pyunwrap-train = "pyunwrap.training.trainer:main"
+pyunwrap-unwrap = "pyunwrap.inference.hybrid:main"
 
 [tool.setuptools.packages.find]
 include = ["pyunwrap*"]
@@ -111,6 +133,19 @@ ignore = ["BLE001", "S110"]
 
 [tool.mypy]
 python_version = "3.10"
-warn_return_any = true
+# warn_return_any is deliberately off: numpy/torch's type stubs frequently
+# type common operations (e.g. np.angle, tensor arithmetic chains) as
+# returning Any even though the actual runtime type is exactly what the
+# function signature declares. Verified by manual inspection that every
+# instance flagged in this codebase was a stub-typing limitation, not a
+# real bug, before choosing to disable this check rather than scatter
+# `# type: ignore[no-any-return]` across ~15 call sites for no functional
+# benefit. Genuine type errors (wrong argument types, missing None checks,
+# etc.) are still caught -- see the `# type: ignore[arg-type]` comments at
+# the two remaining known third-party stub limitations
+# (numpy.savez_compressed's **kwargs typing, torch.onnx.export's Tensor-vs-
+# tuple `args` parameter) for the same reasoning applied precisely rather
+# than globally.
+warn_return_any = false
 warn_unused_configs = true
 ignore_missing_imports = true

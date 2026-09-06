@@ -44,8 +44,6 @@ except ImportError:  # pragma: no cover
     _HAS_RASTERIO = False
 
 import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 

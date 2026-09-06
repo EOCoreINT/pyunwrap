@@ -5,7 +5,7 @@ pyunwrap.data.dataloader
 PyTorch `Dataset` for loading pre-tiled InSAR patches produced by
 `pyunwrap.data.preprocessing`, with on-the-fly data augmentation.
 
-Each sample is returned as a dict of tensors:
+Each sample is returned as a dict of tensors::
 
     {
         "wrapped_phase":  FloatTensor [1, H, W]  (normalized to [-1, 1])

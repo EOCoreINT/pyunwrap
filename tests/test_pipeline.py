@@ -27,6 +27,7 @@ import math
 import numpy as np
 import pytest
 import rasterio
+import torch
 from rasterio.transform import from_origin
 
 from pyunwrap.data.dataloader import InSARTileDataset
@@ -61,6 +62,7 @@ class _DeterministicPixelwiseUnwrapper(PhaseUnwrapper):
 
     def __init__(self) -> None:
         self.backend = "deterministic-fake"
+        self.inference_batch_size = 1  # exercise the default (unbatched) merge path
 
     def _run_tile(self, x: np.ndarray) -> TileInferenceResult:
         coherence_tile = x[1]
@@ -69,6 +71,9 @@ class _DeterministicPixelwiseUnwrapper(PhaseUnwrapper):
         return TileInferenceResult(
             k_hat=k_hat, residue_prob=residue_prob, k_std=np.zeros_like(coherence_tile)
         )
+
+    def _run_tile_batch(self, x_batch: np.ndarray) -> list[TileInferenceResult]:
+        return [self._run_tile(x_batch[i]) for i in range(x_batch.shape[0])]
 
 
 @pytest.fixture
@@ -202,6 +207,120 @@ class TestTileMergingNoArtifacts:
 
 
 @pytest.mark.slow
+class TestMCDropoutUncertainty:
+    """Integration test for real Monte Carlo Dropout uncertainty through the
+    full PhaseUnwrapper path (see AmbiguityNet's dropout_rate and
+    PhaseUnwrapper._enable_mc_dropout)."""
+
+    def test_uncertainty_is_nonzero_and_varies_spatially(self, deterministic_scene_geotiffs):
+        model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.2)
+        unwrapper = PhaseUnwrapper(model=model, device="cpu", mc_dropout_passes=6)
+        result = unwrapper.unwrap(
+            deterministic_scene_geotiffs["wrapped"],
+            deterministic_scene_geotiffs["coherence"],
+            deterministic_scene_geotiffs["amplitude"],
+            tile_size=128,
+            overlap=0,
+        )
+        assert not np.allclose(result.uncertainty, 0.0), (
+            "MC-Dropout uncertainty is uniformly zero -- dropout is not "
+            "actually active during the repeated forward passes."
+        )
+        # Real uncertainty should vary across the scene, not just be a
+        # single repeated constant.
+        assert result.uncertainty.std() > 0.0
+
+    def test_single_pass_gives_zero_uncertainty(self, deterministic_scene_geotiffs):
+        """With mc_dropout_passes=1, no repeated sampling occurs, so
+        uncertainty must be exactly zero (a single deterministic estimate,
+        not an ensemble) -- confirms the passes parameter genuinely controls
+        this rather than uncertainty always being computed regardless."""
+        model = AmbiguityNet(pretrained=False, k_max=10.0, dropout_rate=0.2)
+        unwrapper = PhaseUnwrapper(model=model, device="cpu", mc_dropout_passes=1)
+        result = unwrapper.unwrap(
+            deterministic_scene_geotiffs["wrapped"],
+            deterministic_scene_geotiffs["coherence"],
+            deterministic_scene_geotiffs["amplitude"],
+            tile_size=128,
+            overlap=0,
+        )
+        np.testing.assert_allclose(result.uncertainty, 0.0)
+
+
+class TestBatchedInferenceEquivalence:
+    """Tests for the opt-in `inference_batch_size` parameter added to
+    `PhaseUnwrapper`: batched inference must produce numerically identical
+    results to the default one-tile-at-a-time path, for both the real torch
+    backend and the deterministic fake used elsewhere in this file."""
+
+    def test_batched_matches_unbatched_deterministic_model(self, deterministic_scene_geotiffs):
+        unbatched = _DeterministicPixelwiseUnwrapper()
+        batched = _DeterministicPixelwiseUnwrapper()
+        batched.inference_batch_size = 4
+
+        result_unbatched = unbatched.unwrap(
+            deterministic_scene_geotiffs["wrapped"],
+            deterministic_scene_geotiffs["coherence"],
+            deterministic_scene_geotiffs["amplitude"],
+            tile_size=64,
+            overlap=32,
+        )
+        result_batched = batched.unwrap(
+            deterministic_scene_geotiffs["wrapped"],
+            deterministic_scene_geotiffs["coherence"],
+            deterministic_scene_geotiffs["amplitude"],
+            tile_size=64,
+            overlap=32,
+        )
+        np.testing.assert_array_equal(result_unbatched.ambiguity_map, result_batched.ambiguity_map)
+        np.testing.assert_allclose(
+            result_unbatched.unwrapped_phase, result_batched.unwrapped_phase, atol=1e-9
+        )
+
+    def test_batched_matches_unbatched_real_model(self, deterministic_scene_geotiffs):
+        """Same equivalence check, but through the real PyTorch backend (a
+        genuine AmbiguityNet forward pass), not just the deterministic fake."""
+        torch.manual_seed(0)
+        model = AmbiguityNet(pretrained=False, k_max=10.0)
+        model.eval()
+
+        unwrapper_unbatched = PhaseUnwrapper(
+            model=model, device="cpu", mc_dropout_passes=1, inference_batch_size=1
+        )
+        unwrapper_batched = PhaseUnwrapper(
+            model=model, device="cpu", mc_dropout_passes=1, inference_batch_size=3
+        )
+
+        result_unbatched = unwrapper_unbatched.unwrap(
+            deterministic_scene_geotiffs["wrapped"],
+            deterministic_scene_geotiffs["coherence"],
+            deterministic_scene_geotiffs["amplitude"],
+            tile_size=64,
+            overlap=32,
+        )
+        result_batched = unwrapper_batched.unwrap(
+            deterministic_scene_geotiffs["wrapped"],
+            deterministic_scene_geotiffs["coherence"],
+            deterministic_scene_geotiffs["amplitude"],
+            tile_size=64,
+            overlap=32,
+        )
+        np.testing.assert_array_equal(result_unbatched.ambiguity_map, result_batched.ambiguity_map)
+        np.testing.assert_allclose(
+            result_unbatched.unwrapped_phase,
+            result_batched.unwrapped_phase,
+            atol=1e-4,
+        )
+
+    def test_default_batch_size_is_one(self, deterministic_scene_geotiffs):
+        """A PhaseUnwrapper constructed without specifying inference_batch_size
+        must behave exactly as every prior release did."""
+        torch.manual_seed(0)
+        model = AmbiguityNet(pretrained=False, k_max=10.0)
+        unwrapper = PhaseUnwrapper(model=model, device="cpu", mc_dropout_passes=1)
+        assert unwrapper.inference_batch_size == 1
+
+
 class TestFullPipeline:
     def test_synthetic_to_report_end_to_end(self, tmp_workdir):
         """Synthetic generation -> preprocessing/tiling -> 1-epoch training ->

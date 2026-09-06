@@ -47,119 +47,34 @@ except ImportError:  # pragma: no cover
 
 from pyunwrap.data.dataloader import InSARTileDataset
 from pyunwrap.models.ambiguity_net import AmbiguityNet, AmbiguityNetOutput
-from pyunwrap.models.losses import PhysicsInformedUnwrapLoss, PhysicsLossOutput
+from pyunwrap.models.losses import PhysicsInformedUnwrapLoss, PhysicsLossOutput, SmoothnessConfig
+from pyunwrap.training.curriculum import (
+    CurriculumIndex,
+    CurriculumReplayConfig,
+    CurriculumReplayIndex,
+    TileDifficulty,
+    classify_difficulty_tier,
+    compute_tile_difficulty_stats,
+)
 
-# --------------------------------------------------------------------------- #
-# Curriculum learning
-# --------------------------------------------------------------------------- #
-
-
-@dataclasses.dataclass
-class TileDifficulty:
-    """Per-tile difficulty summary used to drive curriculum filtering.
-
-    Attributes:
-        index: Index into the underlying `InSARTileDataset`.
-        mean_coherence: Mean coherence over the tile, [0, 1].
-        p99_gradient: 99th-percentile absolute spatial gradient of the true
-            unwrapped phase within the tile, radians/pixel (used to detect
-            sub-Nyquist-violating deformation, i.e. gradient > pi). A
-            percentile rather than a hard max is used deliberately: the
-            ground-truth unwrapped phase (per the generator's design -- see
-            `pyunwrap.synthetic.generator`) legitimately includes
-            spatially-*uncorrelated* decorrelation noise, so even physically
-            "easy" tiles routinely contain a handful of isolated single-pixel
-            noise spikes whose raw gradient exceeds pi. A hard max would
-            therefore misclassify nearly every tile as "hard"; the 99th
-            percentile is robust to that noise while still reliably flagging
-            tiles with genuinely widespread steep deformation gradients.
-    """
-
-    index: int
-    mean_coherence: float
-    p99_gradient: float
-
-
-class CurriculumIndex:
-    """Computes and caches per-tile difficulty stats, and exposes epoch-aware
-    index subsets implementing the 3-stage curriculum described in Prompt 4.
-
-    Stage boundaries (by 1-indexed epoch number):
-        - Epochs 1-20:  mean_coherence > 0.7 AND p99_gradient <= pi (easy)
-        - Epochs 21-50: mean_coherence > 0.4 (moderate; includes atmosphere/
-          orbital-ramp-heavy tiles, which are present throughout the
-          synthetic dataset regardless of coherence)
-        - Epochs 51+:   full dataset, no filtering (hard; includes
-          low-coherence tiles and gradients exceeding the Nyquist limit)
-    """
-
-    def __init__(self, dataset: InSARTileDataset) -> None:
-        """
-        Args:
-            dataset: The full training `InSARTileDataset` to index. Must have
-                `require_ground_truth=True` (curriculum stats depend on
-                `true_unwrapped`).
-        """
-        self.dataset = dataset
-        self._stats: list[TileDifficulty] = self._compute_stats()
-
-    def _compute_stats(self) -> list[TileDifficulty]:
-        """Scan every tile once (without augmentation) to compute difficulty stats."""
-        stats = []
-        was_augmenting = self.dataset.augment
-        self.dataset.augment = False  # stats must reflect the canonical, unaugmented tile
-        try:
-            for i in range(len(self.dataset)):
-                sample = self.dataset[i]
-                coherence = sample["coherence"].numpy()
-                mean_coh = float(coherence.mean())
-
-                if "true_unwrapped" in sample:
-                    unwrapped = sample["true_unwrapped"].numpy()
-                    grad_y = np.abs(np.diff(unwrapped, axis=-2))
-                    grad_x = np.abs(np.diff(unwrapped, axis=-1))
-                    combined = np.concatenate([grad_y.ravel(), grad_x.ravel()])
-                    p99_grad = float(np.percentile(combined, 99)) if combined.size > 0 else 0.0
-                else:
-                    p99_grad = 0.0
-
-                stats.append(
-                    TileDifficulty(index=i, mean_coherence=mean_coh, p99_gradient=p99_grad)
-                )
-        finally:
-            self.dataset.augment = was_augmenting
-        return stats
-
-    def indices_for_epoch(self, epoch: int) -> list[int]:
-        """Return the list of dataset indices eligible for training at `epoch` (1-indexed).
-
-        Args:
-            epoch: Current 1-indexed epoch number.
-
-        Returns:
-            List of dataset indices satisfying the curriculum stage's
-            difficulty criteria. Falls back to the full dataset if a stage's
-            filter is too strict and would otherwise yield an empty set
-            (logged via a warning-equivalent print, since an empty epoch
-            would silently stall training).
-        """
-        if epoch <= 20:
-            eligible = [
-                s.index for s in self._stats if s.mean_coherence > 0.7 and s.p99_gradient <= math.pi
-            ]
-        elif epoch <= 50:
-            eligible = [s.index for s in self._stats if s.mean_coherence > 0.4]
-        else:
-            eligible = [s.index for s in self._stats]
-
-        if len(eligible) == 0:
-            print(
-                f"[CurriculumIndex] WARNING: epoch {epoch}'s curriculum filter matched 0 "
-                "tiles; falling back to the full dataset for this epoch to avoid stalling training."
-            )
-            eligible = [s.index for s in self._stats]
-        return eligible
-
+__all__ = [
+    # Re-exported from pyunwrap.training.curriculum for backward
+    # compatibility -- these classes originated in this module before being
+    # extracted; existing `from pyunwrap.training.trainer import
+    # CurriculumIndex`-style imports continue to work unchanged.
+    "CurriculumIndex",
+    "CurriculumReplayConfig",
+    "CurriculumReplayIndex",
+    "TileDifficulty",
+    "Trainer",
+    "ValidationMetrics",
+    "build_curriculum_aware_scheduler",
+    "build_warmup_cosine_scheduler",
+    "classify_difficulty_tier",
+    "compute_tile_difficulty_stats",
+    "evaluate",
+    "evaluate_stratified",
+]
 
 # --------------------------------------------------------------------------- #
 # Validation metrics
@@ -277,9 +192,88 @@ def evaluate(
     )
 
 
+def evaluate_stratified(
+    model: AmbiguityNet,
+    dataset: InSARTileDataset,
+    device: torch.device,
+    batch_size: int = 8,
+    num_workers: int = 0,
+) -> dict[str, ValidationMetrics]:
+    """Run validation broken out by difficulty tier ("easy"/"moderate"/"hard",
+    via `classify_difficulty_tier`) in addition to the overall aggregate.
+
+    Why this exists: `Trainer` originally only tracked one aggregate
+    `val_rmse` across the whole validation set. On a real 60-epoch run, a
+    curriculum-stage LR restart fixed accuracy on hard scenes while
+    silently regressing accuracy on easy ones (a real, measured 74% RMSE
+    regression on synthetic-benchmark scenes resembling the "easy" tier) --
+    and the aggregate metric never revealed it, because improvement on the
+    (numerically larger) hard-tile errors outweighed the regression on
+    easy tiles in the overall average. Stratified tracking makes this kind
+    of regime-specific regression visible during training itself, not just
+    discoverable after the fact via a separate downstream benchmark. See
+    `docs/experiments.md`'s Experiment 3 for the full story.
+
+    Args:
+        model: The `AmbiguityNet` to evaluate.
+        dataset: Validation `InSARTileDataset` (should have `augment=False`
+            and `require_ground_truth=True`).
+        device: Device to run evaluation on.
+        batch_size: Batch size for each tier's temporary `DataLoader`.
+        num_workers: Worker count for each tier's temporary `DataLoader`.
+
+    Returns:
+        A dict with keys `"overall"`, `"easy"`, `"moderate"`, `"hard"`,
+        each mapping to a `ValidationMetrics`. A tier with zero matching
+        tiles in `dataset` is omitted (rather than reported as a
+        misleading zero-sample metric) -- check for a tier's presence
+        before reading it.
+    """
+    results: dict[str, ValidationMetrics] = {}
+
+    overall_loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    results["overall"] = evaluate(model, overall_loader, device)
+
+    stats = compute_tile_difficulty_stats(dataset)
+    tier_indices: dict[str, list[int]] = {"easy": [], "moderate": [], "hard": []}
+    for stat in stats:
+        tier_indices[classify_difficulty_tier(stat)].append(stat.index)
+
+    for tier, indices in tier_indices.items():
+        if len(indices) == 0:
+            continue
+        subset = Subset(dataset, indices)
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        results[tier] = evaluate(model, loader, device)
+
+    return results
+
+
 # --------------------------------------------------------------------------- #
 # LR schedule: linear warmup -> cosine annealing
 # --------------------------------------------------------------------------- #
+
+
+def _safe_drop_last(dataset_size: int, batch_size: int) -> bool:
+    """Whether it's safe to pass `drop_last=True` to a `DataLoader` without
+    risking zero batches per epoch.
+
+    Only drops the final ragged batch when there's at least one full batch
+    of data besides it (`dataset_size > batch_size`). If the whole dataset
+    is smaller than or equal to one batch, dropping it would silently
+    produce zero batches for the entire epoch -- see `_build_epoch_loader`'s
+    docstring for the real training run this was caught on.
+
+    Args:
+        dataset_size: Number of samples in the dataset/subset being loaded.
+        batch_size: The `DataLoader`'s configured batch size.
+
+    Returns:
+        True if dropping the ragged final batch is safe, False otherwise.
+    """
+    return dataset_size > batch_size
 
 
 def build_warmup_cosine_scheduler(
@@ -307,6 +301,82 @@ def build_warmup_cosine_scheduler(
         if epoch < warmup_epochs:
             return (epoch + 1) / max(warmup_epochs, 1)
         progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def build_curriculum_aware_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_epochs: int,
+    restart_epochs: list[int],
+    warmup_epochs: int = 5,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Build a `LambdaLR` that runs an independent warmup+cosine cycle within
+    each curriculum/fine-tuning segment, restarting the LR at each segment
+    boundary instead of letting one long cosine decay run across all of them.
+
+    Motivation (found on a real 60-epoch training run, not a hypothetical):
+    `build_warmup_cosine_scheduler` decays smoothly across the *entire* run,
+    with no awareness of `CurriculumIndex`'s stage transitions (by default
+    at epochs 21 and 51) or `Trainer`'s SNAPHU fine-tuning switch (at
+    `finetune_start_epoch`). On a real run, curriculum stage 3 -- the
+    hardest data, unlocked at epoch 51 -- arrived when the cosine schedule
+    had already decayed the LR to roughly 1/15,000th of its peak value. The
+    model's training loss visibly jumped at that transition (harder data)
+    and never recovered before training ended, because there was no
+    meaningful gradient step size left to adapt with. This scheduler fixes
+    that by giving each segment (stage 1, stage 2, stage 3, and the
+    fine-tuning phase if configured) its own short warmup back up to the
+    original peak LR followed by its own cosine decay over just that
+    segment's epoch span.
+
+    Degenerates to `build_warmup_cosine_scheduler`'s exact schedule when
+    `restart_epochs` contains no epoch other than `1` (i.e. curriculum
+    learning and fine-tuning are both disabled, so there is only one
+    segment spanning the whole run) -- verified by direct comparison in
+    `tests/test_trainer.py`, not just argued for here.
+
+    Args:
+        optimizer: The optimizer to schedule (e.g. AdamW).
+        total_epochs: Total number of training epochs.
+        restart_epochs: 1-indexed epoch numbers at which a new segment (and
+            therefore a fresh warmup+cosine cycle) begins. `1` is always
+            treated as an implicit segment start regardless of whether it's
+            included; values outside `[1, total_epochs]` are ignored.
+        warmup_epochs: Warmup length for each segment, capped to at most
+            `segment_length - 1` for any segment shorter than this (so a
+            short final curriculum stage doesn't spend its entire budget on
+            warmup with no room left to actually decay).
+
+    Returns:
+        A `LambdaLR` scheduler; call `.step()` once per epoch, exactly like
+        `build_warmup_cosine_scheduler`.
+    """
+    starts = sorted({1, *(e for e in restart_epochs if 1 < e <= total_epochs)})
+    segments: list[tuple[int, int]] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] - 1 if i + 1 < len(starts) else total_epochs
+        segments.append((start, end))
+
+    def lr_lambda(step: int) -> float:
+        epoch = (
+            step + 1
+        )  # PyTorch's LambdaLR step counter is 0-indexed; Trainer's epochs are 1-indexed.
+        seg_start, seg_end = segments[-1]
+        for start, end in segments:
+            if start <= epoch <= end:
+                seg_start, seg_end = start, end
+                break
+
+        seg_length = seg_end - seg_start + 1
+        local_epoch = epoch - seg_start
+        seg_warmup = min(warmup_epochs, max(seg_length - 1, 0))
+
+        if local_epoch < seg_warmup:
+            return (local_epoch + 1) / max(seg_warmup, 1)
+        progress = (local_epoch - seg_warmup) / max(seg_length - seg_warmup, 1)
         progress = min(max(progress, 0.0), 1.0)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -357,9 +427,6 @@ class Visualizer:
         Returns:
             Path to the saved figure.
         """
-        import matplotlib
-
-        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
         keys = list(self.history.keys())
@@ -401,9 +468,6 @@ class Visualizer:
         Returns:
             Path to the saved figure.
         """
-        import matplotlib
-
-        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
         error = predicted_unwrapped - true_unwrapped
@@ -464,6 +528,9 @@ class Trainer:
         use_curriculum: bool = True,
         finetune_dataset: InSARTileDataset | None = None,
         finetune_start_epoch: int = 55,
+        stratified_validation: bool = True,
+        curriculum_replay_config: CurriculumReplayConfig | None = None,
+        forgetting_lr_reduction_factor: float | None = 0.5,
     ) -> None:
         """
         Args:
@@ -482,14 +549,64 @@ class Trainer:
             grad_clip_norm: Max gradient norm for `clip_grad_norm_`.
             validate_every: Run `evaluate()` every N epochs.
             device: `"cuda"`, `"cpu"`, or None to auto-detect.
-            use_curriculum: Whether to apply the 3-stage curriculum filter to
-                `train_dataset`. If False, the full dataset is used every
+            use_curriculum: Whether to apply the original 3-stage sequential
+                curriculum filter to `train_dataset`. Ignored (has no
+                effect) when `curriculum_replay_config` is also given and
+                enabled -- see that parameter's docstring for precedence.
+                If both are `False`/`None`, the full dataset is used every
                 epoch (still followed by SNAPHU fine-tuning if configured).
             finetune_dataset: Optional real-data `InSARTileDataset` whose
                 `true_unwrapped` is SNAPHU's pseudo-ground-truth output, used
-                for the final fine-tuning phase.
+                for the final fine-tuning phase. Build this dataset with
+                `pyunwrap.utils.snaphu_integration.generate_snaphu_finetune_dataset`,
+                which runs real SNAPHU unwrapping and filters out any tile
+                where SNAPHU wasn't confident enough to trust as ground truth.
             finetune_start_epoch: 1-indexed epoch at which to switch from the
                 (synthetic, curriculum) `train_dataset` to `finetune_dataset`.
+            stratified_validation: Whether periodic validation also reports
+                RMSE broken out by difficulty tier ("easy"/"moderate"/"hard",
+                via `evaluate_stratified`) in addition to the overall
+                aggregate. On by default -- it reuses the same per-tile
+                stats the curriculum already computes, so the extra cost is
+                a handful of additional forward passes over `val_dataset`,
+                not a second data-processing pipeline.
+            curriculum_replay_config: Optional `CurriculumReplayConfig`. If
+                given and `config.use_curriculum_replay` is `True`, replaces
+                the original sequential `CurriculumIndex` staging with
+                `CurriculumReplayIndex`'s fixed-proportion easy/moderate/hard
+                mixture, sampled fresh every epoch, with automatic
+                forgetting-triggered rebalancing (see
+                `pyunwrap.training.curriculum` for why this exists: the
+                original sequential curriculum was found to cause
+                catastrophic forgetting of easy-tier performance once the
+                hardest stage took over every epoch -- see
+                `docs/experiments.md`, Experiment 3). `None` (the default)
+                preserves the original `use_curriculum` behavior exactly,
+                with zero change to existing training runs.
+
+                Precedence when both `use_curriculum=True` and a
+                `curriculum_replay_config` are given: replay wins, and a
+                one-time note is printed, since sequential staging and
+                fixed-proportion replay are alternative mechanisms for the
+                same underlying goal, not composable ones.
+
+                Curriculum replay also changes the learning-rate schedule's
+                restart points: because replay never introduces an abrupt
+                "suddenly 100% hard data" transition in the first place (the
+                mixture is constant throughout, by design), the
+                sequential-curriculum-stage LR restarts are not added when
+                replay is active. The SNAPHU fine-tuning restart (if
+                configured) still applies either way, since that is a real
+                distribution change regardless of which curriculum mechanism
+                preceded it.
+            forgetting_lr_reduction_factor: When curriculum replay detects
+                forgetting (see `CurriculumReplayIndex.record_easy_validation_metric`),
+                the current learning rate is also multiplied by this factor
+                (in addition to rebalancing the replay mixture), as a
+                persistent scale applied on top of the underlying schedule.
+                `None` disables the LR-reduction side effect; rebalancing
+                still occurs. Has no effect when curriculum replay is not
+                active.
         """
         self.device = (
             torch.device(device)
@@ -513,12 +630,55 @@ class Trainer:
         self.grad_clip_norm = grad_clip_norm
         self.validate_every = validate_every
         self.use_curriculum = use_curriculum
+        self.stratified_validation = stratified_validation
+        self.forgetting_lr_reduction_factor = forgetting_lr_reduction_factor
+        self._lr_scale_factor = 1.0  # persistent multiplier applied on top of the schedule
+
+        replay_active = (
+            curriculum_replay_config is not None and curriculum_replay_config.use_curriculum_replay
+        )
+        if replay_active and use_curriculum:
+            print(
+                "[Trainer] Both use_curriculum=True and an enabled curriculum_replay_config "
+                "were given; curriculum replay takes precedence and the original sequential "
+                "curriculum staging will not be used this run."
+            )
+        self.curriculum_replay_config = curriculum_replay_config
+        self.curriculum_replay_index: CurriculumReplayIndex | None = None
+        if replay_active:
+            assert (
+                curriculum_replay_config is not None
+            )  # implied by replay_active, for mypy's narrowing
+            self.curriculum_replay_index = CurriculumReplayIndex(
+                train_dataset, curriculum_replay_config
+            )
 
         self.criterion = PhysicsInformedUnwrapLoss()
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=base_lr)
-        self.scheduler = build_warmup_cosine_scheduler(self.optimizer, total_epochs, warmup_epochs)
 
-        self.curriculum_index = CurriculumIndex(train_dataset) if use_curriculum else None
+        # Restart the LR schedule at every point the training data
+        # distribution changes abruptly: each curriculum stage transition,
+        # and the SNAPHU fine-tuning switch if configured. See
+        # build_curriculum_aware_scheduler's docstring for the real run
+        # that motivated this (a plain single-run cosine decay left the LR
+        # near zero exactly when curriculum stage 3's harder data arrived).
+        # Not added for curriculum replay -- see curriculum_replay_config's
+        # docstring above for why replay doesn't need this.
+        restart_epochs = [1]
+        if use_curriculum and not replay_active:
+            restart_epochs += [
+                CurriculumIndex.STAGE_1_END_EPOCH + 1,
+                CurriculumIndex.STAGE_2_END_EPOCH + 1,
+            ]
+        if finetune_dataset is not None:
+            restart_epochs.append(finetune_start_epoch)
+        self.scheduler = build_curriculum_aware_scheduler(
+            self.optimizer, total_epochs, restart_epochs, warmup_epochs
+        )
+
+        self.curriculum_index = (
+            CurriculumIndex(train_dataset) if (use_curriculum and not replay_active) else None
+        )
 
         self.writer: SummaryWriter | None = None
         if _HAS_TENSORBOARD:
@@ -542,6 +702,19 @@ class Trainer:
     def _build_epoch_loader(self, epoch: int) -> DataLoader:
         """Build the training DataLoader for `epoch`, applying curriculum
         filtering or switching to the SNAPHU fine-tuning dataset as configured.
+
+        Note on `drop_last`: PyTorch's `DataLoader(drop_last=True)` discards
+        the final ragged batch -- but if the *entire* dataset is smaller than
+        `batch_size` (e.g. an early, strict curriculum stage matches only a
+        handful of tiles), there is no batch other than that ragged one, so
+        `drop_last=True` silently yields ZERO batches for the whole epoch.
+        `_train_one_epoch` would then run its `for batch in loader` loop zero
+        times, leave `running` empty, and report `loss=nan` -- an epoch that
+        looks like it "completed" while doing no actual training at all. This
+        was caught during a real training run (a curriculum subset of 4 tiles
+        against `batch_size=8` silently produced 20 consecutive no-op
+        epochs). `_safe_drop_last` below prevents it by only dropping the
+        ragged batch when there's at least one full batch of data besides it.
         """
         if self.finetune_dataset is not None and epoch >= self.finetune_start_epoch:
             print(
@@ -552,7 +725,24 @@ class Trainer:
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=self.num_workers,
-                drop_last=True,
+                drop_last=_safe_drop_last(len(self.finetune_dataset), self.batch_size),
+            )
+
+        if self.curriculum_replay_index is not None:
+            indices = self.curriculum_replay_index.indices_for_epoch(epoch)
+            subset = Subset(self.train_dataset, indices)
+            print(
+                f"[Trainer] Epoch {epoch}: curriculum REPLAY mixture size = {len(indices)} "
+                f"(easy={self.curriculum_replay_index.easy_fraction:.2f}, "
+                f"moderate={self.curriculum_replay_index.medium_fraction:.2f}, "
+                f"hard={self.curriculum_replay_index.hard_fraction:.2f})"
+            )
+            return DataLoader(
+                subset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                drop_last=_safe_drop_last(len(subset), self.batch_size),
             )
 
         if self.use_curriculum and self.curriculum_index is not None:
@@ -566,7 +756,7 @@ class Trainer:
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=self.num_workers,
-                drop_last=True,
+                drop_last=_safe_drop_last(len(subset), self.batch_size),
             )
 
         return DataLoader(
@@ -574,7 +764,7 @@ class Trainer:
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            drop_last=True,
+            drop_last=_safe_drop_last(len(self.train_dataset), self.batch_size),
         )
 
     # ----------------------------------------------------------------- #
@@ -620,7 +810,29 @@ class Trainer:
             start = time.time()
             loader = self._build_epoch_loader(epoch)
             train_metrics = self._train_one_epoch(epoch, loader)
+            if not train_metrics:
+                # Defense in depth: _safe_drop_last prevents the known cause
+                # (a curriculum/fine-tune subset smaller than one batch), but
+                # if any other future edge case ever produces zero batches
+                # for an epoch, fail loudly rather than silently logging
+                # loss=nan and proceeding as though training happened.
+                raise RuntimeError(
+                    f"Epoch {epoch} produced zero training batches (dataset/subset "
+                    f"size may be smaller than batch_size={self.batch_size}). No "
+                    "gradient updates occurred this epoch -- refusing to silently "
+                    "continue. Reduce batch_size or increase the dataset/subset size."
+                )
             self.scheduler.step()
+            # Re-apply any persistent forgetting-triggered LR reduction:
+            # LambdaLR recomputes lr = base_lr * lambda(step) from the
+            # *original* base_lr on every .step() call, so a one-time
+            # manual reduction would otherwise be silently overwritten by
+            # the very next .step() -- this must be reapplied every epoch
+            # to actually persist. See CurriculumReplayIndex's forgetting
+            # detection and forgetting_lr_reduction_factor's docstring.
+            if self._lr_scale_factor != 1.0:
+                for group in self.optimizer.param_groups:
+                    group["lr"] *= self._lr_scale_factor
             elapsed = time.time() - start
 
             lr = self.optimizer.param_groups[0]["lr"]
@@ -643,6 +855,50 @@ class Trainer:
                 epoch_scalars["val/rmse_rad"] = val_metrics.rmse_rad
                 epoch_scalars["val/pct_pixels_under_0p1_rad"] = val_metrics.pct_pixels_under_0p1_rad
                 epoch_scalars["val/residue_count"] = float(val_metrics.residue_count)
+
+                needs_stratified = (
+                    self.stratified_validation or self.curriculum_replay_index is not None
+                )
+                if needs_stratified:
+                    tiered = evaluate_stratified(
+                        self.model, self.val_dataset, self.device, self.batch_size, self.num_workers
+                    )
+                    if self.stratified_validation:
+                        tier_summary_parts = []
+                        for tier in ("easy", "moderate", "hard"):
+                            if tier not in tiered:
+                                continue
+                            tier_metrics = tiered[tier]
+                            epoch_scalars[f"val/rmse_rad_{tier}"] = tier_metrics.rmse_rad
+                            tier_summary_parts.append(
+                                f"{tier}={tier_metrics.rmse_rad:.3f}({tier_metrics.n_samples})"
+                            )
+                        if tier_summary_parts:
+                            log_line += " | val_rmse_by_tier: " + " ".join(tier_summary_parts)
+
+                    if self.curriculum_replay_index is not None and "easy" in tiered:
+                        adjusted = self.curriculum_replay_index.record_easy_validation_metric(
+                            epoch, tiered["easy"].rmse_rad
+                        )
+                        epoch_scalars["curriculum_replay/easy_fraction"] = (
+                            self.curriculum_replay_index.easy_fraction
+                        )
+                        epoch_scalars["curriculum_replay/medium_fraction"] = (
+                            self.curriculum_replay_index.medium_fraction
+                        )
+                        epoch_scalars["curriculum_replay/hard_fraction"] = (
+                            self.curriculum_replay_index.hard_fraction
+                        )
+                        if adjusted and self.forgetting_lr_reduction_factor is not None:
+                            self._lr_scale_factor *= self.forgetting_lr_reduction_factor
+                            for group in self.optimizer.param_groups:
+                                group["lr"] *= self.forgetting_lr_reduction_factor
+                            log_line += (
+                                f" | FORGETTING DETECTED: replay rebalanced, "
+                                f"lr scaled by {self.forgetting_lr_reduction_factor:g} "
+                                f"(cumulative scale={self._lr_scale_factor:.3g})"
+                            )
+
                 self._save_checkpoint(epoch, val_metrics)
 
             print(log_line)
@@ -677,16 +933,20 @@ def build_argparser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for `pyunwrap-train`."""
     parser = argparse.ArgumentParser(description="Train AmbiguityNet for InSAR phase unwrapping.")
     parser.add_argument(
-        "--train-hdf5", type=str, required=True, help="Path to training tiles HDF5 file."
+        "--train-hdf5", type=str, default=None, help="Path to training tiles HDF5 file."
     )
     parser.add_argument(
-        "--val-hdf5", type=str, required=True, help="Path to validation tiles HDF5 file."
+        "--val-hdf5", type=str, default=None, help="Path to validation tiles HDF5 file."
     )
     parser.add_argument(
         "--finetune-hdf5",
         type=str,
         default=None,
-        help="Optional path to SNAPHU pseudo-ground-truth fine-tuning tiles HDF5 file.",
+        help=(
+            "Optional path to a SNAPHU pseudo-ground-truth fine-tuning tiles "
+            "HDF5 file, built via "
+            "pyunwrap.utils.snaphu_integration.generate_snaphu_finetune_dataset."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -711,6 +971,48 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable curriculum learning; use full dataset every epoch.",
     )
+    parser.add_argument(
+        "--no-stratified-validation",
+        action="store_true",
+        help=(
+            "Disable per-difficulty-tier validation breakdown (easy/moderate/hard); "
+            "report only the overall aggregate val_rmse."
+        ),
+    )
+    parser.add_argument(
+        "--use-curriculum-replay",
+        action="store_true",
+        help=(
+            "Use fixed-proportion easy/moderate/hard curriculum replay (with automatic "
+            "forgetting detection) instead of the original sequential 3-stage curriculum. "
+            "See pyunwrap.training.curriculum.CurriculumReplayConfig for the underlying "
+            "defaults and docs/experiments.md for why this exists."
+        ),
+    )
+    parser.add_argument(
+        "--smoothness-weight",
+        type=float,
+        default=None,
+        help=(
+            "If set, enables the edge-preserving CoherenceWeightedPhaseSmoothnessLoss "
+            "(Component 5) at this weight, in addition to the existing (always-on, "
+            "simpler) smoothness term. Unset (default) leaves Component 5 fully "
+            "disabled, for exact backward compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--real-data-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a directory containing a real (or real-like) data stack "
+            "(amplitude.npy, wrapped_phase.npy, coherence.npy -- see "
+            "pyunwrap.data.real_injection.load_real_stack). If given, training and "
+            "validation datasets are built via the real-data + synthetic-injection "
+            "pipeline (pyunwrap.data.real_injection.build_real_injection_datasets) "
+            "instead of --train-hdf5/--val-hdf5, which become optional in that case."
+        ),
+    )
     parser.add_argument("--device", type=str, default=None, choices=[None, "cuda", "cpu"])
     return parser
 
@@ -720,8 +1022,36 @@ def main() -> None:
     parser = build_argparser()
     args = parser.parse_args()
 
-    train_dataset = InSARTileDataset(args.train_hdf5, augment=True, require_ground_truth=True)
-    val_dataset = InSARTileDataset(args.val_hdf5, augment=False, require_ground_truth=True)
+    if args.real_data_path:
+        from pyunwrap.data.real_injection import (
+            RealSyntheticInjectionConfig,
+            build_real_injection_datasets,
+            load_real_stack,
+        )
+
+        real_stack = load_real_stack(
+            amplitude_path=f"{args.real_data_path}/amplitude.npy",
+            wrapped_phase_path=f"{args.real_data_path}/wrapped_phase.npy",
+            coherence_path=f"{args.real_data_path}/coherence.npy",
+        )
+        injection_config = RealSyntheticInjectionConfig()
+        dataset_paths = build_real_injection_datasets(
+            real_stack,
+            injection_config,
+            out_dir=f"{args.out_dir}/real_injection_cache",
+        )
+        train_dataset = InSARTileDataset(
+            dataset_paths["train"], augment=True, require_ground_truth=True
+        )
+        val_dataset = InSARTileDataset(
+            dataset_paths["val"], augment=False, require_ground_truth=True
+        )
+    elif args.train_hdf5 and args.val_hdf5:
+        train_dataset = InSARTileDataset(args.train_hdf5, augment=True, require_ground_truth=True)
+        val_dataset = InSARTileDataset(args.val_hdf5, augment=False, require_ground_truth=True)
+    else:
+        parser.error("Either --real-data-path, or both --train-hdf5 and --val-hdf5, is required.")
+
     finetune_dataset = (
         InSARTileDataset(args.finetune_hdf5, augment=True, require_ground_truth=True)
         if args.finetune_hdf5
@@ -729,6 +1059,10 @@ def main() -> None:
     )
 
     model = AmbiguityNet(pretrained=not args.no_pretrained, k_max=args.k_max)
+
+    curriculum_replay_config = None
+    if args.use_curriculum_replay:
+        curriculum_replay_config = CurriculumReplayConfig()
 
     trainer = Trainer(
         model=model,
@@ -746,7 +1080,15 @@ def main() -> None:
         use_curriculum=not args.no_curriculum,
         finetune_dataset=finetune_dataset,
         finetune_start_epoch=args.finetune_start_epoch,
+        stratified_validation=not args.no_stratified_validation,
+        curriculum_replay_config=curriculum_replay_config,
     )
+
+    if args.smoothness_weight is not None:
+        trainer.criterion = PhysicsInformedUnwrapLoss(
+            smoothness_config=SmoothnessConfig(smoothness_weight=args.smoothness_weight),
+        )
+
     trainer.fit()
 
 

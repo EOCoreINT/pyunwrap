@@ -261,7 +261,7 @@ def generate_report(
 
     has_ground_truth = true_unwrapped is not None
     performance_metrics: list[tuple[str, str]] = []
-    if has_ground_truth:
+    if true_unwrapped is not None:
         _write_html_asset(
             phase_plots.plot_phase_surface_comparison_3d(result.unwrapped_phase, true_unwrapped),
             assets_dir,
@@ -300,7 +300,7 @@ def generate_report(
     has_explainability = model is not None and sample_tile_input is not None
     channel_importance: list[tuple[str, str]] = []
     has_calibration = False
-    if has_explainability:
+    if model is not None and sample_tile_input is not None:
         from pyunwrap.analytics import explainability
 
         try:

@@ -319,7 +319,7 @@ def save_tiles_npz(
     written: list[Path] = []
     for spec, tile in tiles:
         path = out_dir / f"{prefix}_{spec.row:06d}_{spec.col:06d}.npz"
-        np.savez_compressed(path, row=spec.row, col=spec.col, **tile)
+        np.savez_compressed(path, row=spec.row, col=spec.col, **tile)  # type: ignore[arg-type]
         written.append(path)
     return written
 

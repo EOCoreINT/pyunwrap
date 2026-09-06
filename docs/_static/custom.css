@@ -1,0 +1,17 @@
+/* Small, deliberate tweaks on top of the furo theme -- not a redesign. */
+
+/* Give the sidebar logo a bit of breathing room. */
+.sidebar-logo {
+  max-width: 72px;
+  margin: 1rem auto 0.5rem auto;
+}
+
+/* Keep code blocks from feeling cramped in narrow content columns. */
+.highlight pre {
+  font-size: 0.85rem;
+}
+
+/* Nyquist/phase equations read better with a touch more line height. */
+article p, article li {
+  line-height: 1.6;
+}

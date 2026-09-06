@@ -277,6 +277,7 @@ class AmbiguityNet(nn.Module):
         pretrained: bool = True,
         k_max: float = 10.0,
         decoder_channels: tuple[int, int, int, int, int] = (256, 128, 64, 32, 16),
+        dropout_rate: float = 0.1,
     ) -> None:
         """
         Args:
@@ -293,9 +294,24 @@ class AmbiguityNet(nn.Module):
             decoder_channels: Output channel count of each of the 5 decoder
                 stages (4 upsampling stages + the final full-resolution head
                 stage), coarsest-to-finest.
+            dropout_rate: Drop probability for the `nn.Dropout2d` layer
+                inserted after each decoder stage. These serve two purposes:
+                (1) light regularization during ordinary training, and (2)
+                enabling genuine Monte Carlo Dropout uncertainty at inference
+                (see `pyunwrap.inference.unwrapper.PhaseUnwrapper`'s
+                `mc_dropout_passes`, which repeatedly samples these layers in
+                train mode while the rest of the network stays in eval mode).
+                Earlier versions of `AmbiguityNet` had no dropout layers at
+                all, making MC-Dropout uncertainty an unconditional no-op;
+                this is the fix, not a redesign -- placement (spatial/2D
+                dropout after each decoder block, dropping whole feature
+                channels rather than individual pixels) follows standard
+                practice for Bayesian segmentation-style U-Nets. Set to 0.0
+                to disable (equivalent to the old no-dropout behavior).
         """
         super().__init__()
         self.k_max = k_max
+        self.dropout_rate = dropout_rate
         self.encoder = ResNet34Encoder(in_channels=in_channels, pretrained=pretrained)
         enc_ch = self.encoder.out_channels  # (64, 64, 128, 256, 512), stem..layer4
 
@@ -319,6 +335,14 @@ class AmbiguityNet(nn.Module):
         # c3 (stride2) -> up -> no skip available -> c4 (stride1, full resolution)
         self.dec0 = DecoderBlock(in_channels=c3, skip_channels=0, out_channels=c4)
 
+        # Spatial (2D) dropout after each decoder stage -- see dropout_rate's
+        # docstring above for why these exist and where MC-Dropout consumes them.
+        self.drop4 = nn.Dropout2d(dropout_rate)
+        self.drop3 = nn.Dropout2d(dropout_rate)
+        self.drop2 = nn.Dropout2d(dropout_rate)
+        self.drop1 = nn.Dropout2d(dropout_rate)
+        self.drop0 = nn.Dropout2d(dropout_rate)
+
         # Output heads, applied at full input resolution.
         self.ambiguity_head = nn.Conv2d(c4, 1, kernel_size=1)
         self.residue_head = nn.Conv2d(c4, 1, kernel_size=1)
@@ -339,10 +363,15 @@ class AmbiguityNet(nn.Module):
         stem, l1, l2, l3, l4 = self.encoder(x)
 
         d = self.dec4(l4, l3)
+        d = self.drop4(d)
         d = self.dec3(d, l2)
+        d = self.drop3(d)
         d = self.dec2(d, l1)
+        d = self.drop2(d)
         d = self.dec1(d, stem)
+        d = self.drop1(d)
         d = self.dec0(d, skip=None)  # final upsample back to full input resolution
+        d = self.drop0(d)
 
         if d.shape[-2:] != x.shape[-2:]:
             # Final safety net in case of odd input sizes not perfectly

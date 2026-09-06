@@ -221,6 +221,7 @@ class PhaseUnwrapper:
         onnx_path: str | Path | None = None,
         device: str | None = None,
         mc_dropout_passes: int = 5,
+        inference_batch_size: int = 1,
     ) -> None:
         """
         Args:
@@ -234,6 +235,17 @@ class PhaseUnwrapper:
             mc_dropout_passes: Number of stochastic forward passes used to
                 estimate per-pixel ambiguity uncertainty via Monte Carlo
                 Dropout. Only applies to the torch backend.
+            inference_batch_size: Number of tiles processed per forward pass
+                during `unwrap()`. The default, `1`, processes tiles one at a
+                time (matches every prior release's behavior exactly, and is
+                what any custom `_run_tile` override -- e.g. in tests --
+                continues to go through unchanged). Set higher to batch
+                multiple tiles into a single forward pass, which matters far
+                more on GPU (where a single small-tile forward pass often
+                leaves most of the device idle) than on CPU. Batched and
+                unbatched paths are verified to produce numerically identical
+                merged results (see `tests/test_pipeline.py`'s
+                `TestBatchedInferenceEquivalence`).
 
         Raises:
             ValueError: If both or neither of `model`/`onnx_path` are given.
@@ -242,6 +254,9 @@ class PhaseUnwrapper:
             raise ValueError("Provide exactly one of `model` or `onnx_path`.")
 
         self.mc_dropout_passes = mc_dropout_passes
+        self.inference_batch_size = inference_batch_size
+        self.model: AmbiguityNet | None
+        self.engine: InferenceEngine | None
 
         if model is not None:
             self.backend = "torch"
@@ -255,6 +270,7 @@ class PhaseUnwrapper:
         else:
             self.backend = "onnx"
             self.model = None
+            assert onnx_path is not None  # guaranteed by the check above
             self.engine = InferenceEngine(onnx_path, prefer_gpu=True)
             print(f"[PhaseUnwrapper] ONNX backend initialized: {self.engine.backend}")
 
@@ -316,21 +332,38 @@ class PhaseUnwrapper:
             `TileInferenceResult` for this tile.
         """
         x_t = torch.from_numpy(x).float().unsqueeze(0).to(self.device)
+        assert self.model is not None, "torch backend requires self.model to be set"
 
         if self.mc_dropout_passes > 1:
             self._enable_mc_dropout(self.model)
-            k_samples = []
+            k_hat_samples = []
+            k_continuous_samples = []
             residue_samples = []
             with torch.no_grad():
                 for _ in range(self.mc_dropout_passes):
                     out = self.model(x_t)
-                    k_samples.append(out.k_hat.squeeze().cpu().numpy())
+                    k_hat_samples.append(out.k_hat.squeeze().cpu().numpy())
+                    k_continuous_samples.append(out.k_continuous.squeeze().cpu().numpy())
                     residue_samples.append(out.residue_prob.squeeze().cpu().numpy())
             self.model.eval()  # restore standard eval mode after MC Dropout sampling
 
-            k_stack = np.stack(k_samples, axis=0)
-            k_hat = np.median(k_stack, axis=0)  # median is robust to occasional off-by-one flips
-            k_std = k_stack.std(axis=0)
+            k_hat_stack = np.stack(k_hat_samples, axis=0)
+            k_hat = np.median(
+                k_hat_stack, axis=0
+            )  # median is robust to occasional off-by-one flips
+
+            # Uncertainty is computed from the CONTINUOUS k samples, not the
+            # rounded integer ones: dropout-induced noise is often smaller
+            # than the distance to the nearest integer boundary, so the
+            # rounded k_hat can stay identical across every MC pass even
+            # when the model's underlying continuous prediction genuinely
+            # varies -- computing std on k_hat_stack would then silently
+            # report zero uncertainty despite real stochasticity being
+            # present (caught via a test that unexpectedly found exactly
+            # this: an all-constant ambiguity_map with allegedly "active"
+            # dropout still reporting uniformly-zero uncertainty).
+            k_continuous_stack = np.stack(k_continuous_samples, axis=0)
+            k_std = k_continuous_stack.std(axis=0)
             residue_prob = np.mean(residue_samples, axis=0)
         else:
             self.model.eval()
@@ -349,13 +382,11 @@ class PhaseUnwrapper:
         repeated forward passes used for Monte Carlo Dropout uncertainty
         estimation.
 
-        Note: `AmbiguityNet` as defined in `ambiguity_net.py` does not
-        currently include explicit Dropout layers (BatchNorm provides some
-        stochasticity in train mode, but is not a substitute for Dropout).
-        This method is written to correctly enable MC Dropout uncertainty
-        estimation for any future revision of the architecture that adds
-        `nn.Dropout`/`nn.Dropout2d` layers, without requiring any change to
-        `PhaseUnwrapper`'s calling code.
+        `AmbiguityNet` includes `nn.Dropout2d` layers after each decoder
+        stage specifically to make this meaningful (see its `dropout_rate`
+        constructor parameter); this method requires no changes if a future
+        architecture revision adds further `nn.Dropout`/`nn.Dropout3d`
+        layers elsewhere, since it discovers them by type rather than by name.
         """
         model.eval()
         for module in model.modules():
@@ -373,6 +404,7 @@ class PhaseUnwrapper:
             exported ONNX graphs run deterministically in eval mode).
         """
         x_batch = x[np.newaxis, ...].astype(np.float32)
+        assert self.engine is not None, "ONNX backend requires self.engine to be set"
         outputs = self.engine.run(x_batch)
         k_hat, _k_cont, residue_prob, _phi_hat = outputs
         return TileInferenceResult(
@@ -385,6 +417,94 @@ class PhaseUnwrapper:
         if self.backend == "torch":
             return self._run_tile_torch(x)
         return self._run_tile_onnx(x)
+
+    # ----------------------------------------------------------------- #
+    # Batched inference (opt-in via inference_batch_size > 1)
+    # ----------------------------------------------------------------- #
+
+    def _run_tile_batch_torch(self, x_batch: np.ndarray) -> list[TileInferenceResult]:
+        """Run a batch of tiles through the PyTorch backend in one forward
+        pass (or `mc_dropout_passes` forward passes over the whole batch, for
+        MC-Dropout uncertainty), returning one `TileInferenceResult` per tile.
+
+        Args:
+            x_batch: Stacked tile inputs, shape [N, 3, H, W].
+
+        Returns:
+            A list of `N` `TileInferenceResult`s, in the same order as `x_batch`.
+        """
+        x_t = torch.from_numpy(x_batch).float().to(self.device)
+        assert self.model is not None, "torch backend requires self.model to be set"
+
+        if self.mc_dropout_passes > 1:
+            self._enable_mc_dropout(self.model)
+            k_hat_samples = []
+            k_continuous_samples = []
+            residue_samples = []
+            with torch.no_grad():
+                for _ in range(self.mc_dropout_passes):
+                    out = self.model(x_t)
+                    k_hat_samples.append(out.k_hat.cpu().numpy())
+                    k_continuous_samples.append(out.k_continuous.cpu().numpy())
+                    residue_samples.append(out.residue_prob.cpu().numpy())
+            self.model.eval()
+
+            k_hat_stack = np.stack(k_hat_samples, axis=0)  # [passes, N, 1, H, W]
+            k_hat_batch = np.median(k_hat_stack, axis=0)
+            # See _run_tile_torch's inline comment: uncertainty must come
+            # from the continuous samples, not the rounded ones, or it
+            # silently degenerates to zero whenever dropout noise doesn't
+            # cross an integer boundary.
+            k_continuous_stack = np.stack(k_continuous_samples, axis=0)
+            k_std_batch = k_continuous_stack.std(axis=0)
+            residue_prob_batch = np.mean(residue_samples, axis=0)
+        else:
+            self.model.eval()
+            with torch.no_grad():
+                out = self.model(x_t)
+            k_hat_batch = out.k_hat.cpu().numpy()
+            residue_prob_batch = out.residue_prob.cpu().numpy()
+            k_std_batch = np.zeros_like(k_hat_batch)
+
+        return [
+            TileInferenceResult(
+                k_hat=k_hat_batch[i, 0],
+                residue_prob=residue_prob_batch[i, 0],
+                k_std=k_std_batch[i, 0],
+            )
+            for i in range(x_batch.shape[0])
+        ]
+
+    def _run_tile_batch_onnx(self, x_batch: np.ndarray) -> list[TileInferenceResult]:
+        """Run a batch of tiles through the ONNX backend in one call.
+
+        `InferenceEngine.run` already accepts an arbitrary batch dimension
+        (see its docstring), so this is a thin wrapper that just skips the
+        `x[np.newaxis, ...]` single-tile reshape `_run_tile_onnx` does.
+
+        Args:
+            x_batch: Stacked tile inputs, shape [N, 3, H, W].
+
+        Returns:
+            A list of `N` `TileInferenceResult`s (no MC-Dropout support, same
+            as the single-tile ONNX path -- exported graphs run deterministically).
+        """
+        assert self.engine is not None, "ONNX backend requires self.engine to be set"
+        outputs = self.engine.run(x_batch.astype(np.float32))
+        k_hat, _k_cont, residue_prob, _phi_hat = outputs
+        return [
+            TileInferenceResult(
+                k_hat=k_hat[i, 0],
+                residue_prob=residue_prob[i, 0],
+                k_std=np.zeros_like(k_hat[i, 0]),
+            )
+            for i in range(x_batch.shape[0])
+        ]
+
+    def _run_tile_batch(self, x_batch: np.ndarray) -> list[TileInferenceResult]:
+        if self.backend == "torch":
+            return self._run_tile_batch_torch(x_batch)
+        return self._run_tile_batch_onnx(x_batch)
 
     # ----------------------------------------------------------------- #
     # Smart tile merging
@@ -420,14 +540,13 @@ class PhaseUnwrapper:
         uncertainty_accum = np.zeros(raster_shape, dtype=np.float64)
         weight_accum = np.zeros(raster_shape, dtype=np.float64)
 
-        for spec in tile_specs:
+        def _build_tile_input(spec: TileSpec) -> np.ndarray:
             wrapped_tile = extract_tile(rasters.wrapped_phase, spec)
             coherence_tile = extract_tile(rasters.coherence, spec)
             amplitude_tile = extract_tile(rasters.amplitude, spec)
-            x = np.stack([wrapped_tile, coherence_tile, amplitude_tile], axis=0)
+            return np.stack([wrapped_tile, coherence_tile, amplitude_tile], axis=0)
 
-            result = self._run_tile(x)
-
+        def _accumulate(spec: TileSpec, result: TileInferenceResult) -> None:
             # Per-pixel blend weight: an edge-aware raised-cosine taper
             # (spatial smoothness across genuine tile overlaps, full weight
             # at the scene's outer boundary -- see `build_tile_window`)
@@ -445,6 +564,24 @@ class PhaseUnwrapper:
             residue_accum[row_sl, col_sl] += result.residue_prob * tile_weight
             uncertainty_accum[row_sl, col_sl] += result.k_std * tile_weight
             weight_accum[row_sl, col_sl] += tile_weight
+
+        if getattr(self, "inference_batch_size", 1) <= 1:
+            # Default path: identical to every prior release, tile by tile.
+            # Kept as a distinct code path (rather than "batching with
+            # batch_size=1") so any custom _run_tile override -- including
+            # in existing tests -- continues to work unchanged.
+            for spec in tile_specs:
+                x = _build_tile_input(spec)
+                result = self._run_tile(x)
+                _accumulate(spec, result)
+        else:
+            batch_size = self.inference_batch_size
+            for batch_start in range(0, len(tile_specs), batch_size):
+                batch_specs = tile_specs[batch_start : batch_start + batch_size]
+                x_batch = np.stack([_build_tile_input(spec) for spec in batch_specs], axis=0)
+                batch_results = self._run_tile_batch(x_batch)
+                for spec, result in zip(batch_specs, batch_results):
+                    _accumulate(spec, result)
 
         # Every pixel is covered by at least one tile by construction of
         # `compute_tile_grid`, so weight_accum should never be exactly zero;
