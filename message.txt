@@ -1,0 +1,99 @@
+Reframe pyunwrap as a hybrid, regime-aware unwrapper; implement four strategic upgrades
+
+This project's own benchmarks show pyunwrap beats SNAPHU reliably in
+exactly one regime (low-coherence decorrelation) and loses on most
+others. Rather than continue framing the goal as "beat SNAPHU
+everywhere" -- a claim the evidence doesn't support -- this commit
+reframes the project around a hybrid, regime-aware unwrapper and
+implements the four changes that make that framing real, not aspirational.
+
+Strategy 1 -- Real-data + synthetic-injection pipeline
+- Add pyunwrap/data/real_injection.py: inject synthetic deformation
+  (Gaussian bowl, Mogi, Okada, orbital ramp, or a new nonlinear-transient
+  model) with exactly-known ground truth into a real (or real-like)
+  wrapped-phase/amplitude/coherence stack, preserving real noise texture
+  by construction.
+- Spatially-blocked train/val/test splitting prevents pixel-level
+  leakage, verified directly rather than assumed.
+- Output is cached by a hash of the injection config and loads directly
+  via the existing InSARTileDataset/Trainer pipeline.
+- Honest scope note carried through the module's docstrings: built and
+  tested against a labeled synthetic fixture, not genuine SAR imagery,
+  since this environment cannot reach any real SAR data provider.
+- 48 tests, including a full real-injection -> HDF5 -> Trainer.fit()
+  integration test and physics-identity verification for all 5
+  injection kinds.
+
+Strategy 2 -- Curriculum replay
+- Add pyunwrap/training/curriculum.py: extract the original sequential
+  CurriculumIndex out of trainer.py (re-exported there for backward
+  compatibility) and add CurriculumReplayConfig/CurriculumReplayIndex.
+- Every epoch draws a fixed-proportion mixture of easy/moderate/hard
+  tiles instead of a strict stage handoff, directly targeting the
+  catastrophic-forgetting failure mode documented in
+  docs/experiments.md's Experiment 3.
+- Automatic forgetting detection (trend-based and absolute-threshold)
+  increases the easy-replay fraction, taking the difference from
+  hard_fraction first, then medium_replay_fraction.
+- Found and fixed a real bug: LambdaLR recomputes from the original
+  base LR every .step() call, so a one-time forgetting-triggered LR
+  reduction would silently be overwritten the next epoch unless
+  reapplied persistently.
+- 19 tests.
+
+Strategy 3 -- Coherence-weighted phase-smoothness regularizer
+- Add SmoothnessConfig / CoherenceWeightedPhaseSmoothnessLoss to
+  pyunwrap/models/losses.py: an edge-preserving sibling to the existing
+  (simpler, unconditional L2) smoothness term, using a robust Huber/L1
+  norm weighted by coherence * exp(-|gradient| / edge_tau).
+- Composed into PhysicsInformedUnwrapLoss as an opt-in Component 5 --
+  verified byte-for-byte backward compatible when omitted.
+- 18 tests, including a direct check that a genuine discontinuity is
+  penalized less than equivalent-energy incoherent noise.
+
+Strategy 4 -- Hybrid unwrapper
+- Add pyunwrap/inference/hybrid.py: HybridUnwrapper routes each pixel to
+  classical unwrapping (high coherence/low gradient), the learned model
+  (low coherence), or a confidence-weighted blend, based on this
+  project's own benchmark evidence for where each method actually wins.
+- Merging happens in integer ambiguity space, not raw phase space --
+  verified numerically (not just argued) that the final output satisfies
+  wrap(unwrapped_phase) == wrapped_phase exactly, on a real controlled
+  split-coherence scene.
+- Falls back to a real, different classical algorithm (scikit-image's
+  quality-guided path-following unwrapper) when SNAPHU isn't installed,
+  so CPU-only, SNAPHU-free execution and tests remain possible.
+- Both the learned model and classical adapter fail loudly or degrade
+  with an explicit warning per their fallback flags, never silently.
+- 28 tests, including the wrap-consistency invariant and both merge
+  strategies (confidence_weighted, hard_switch).
+
+Benchmarking
+- Extend pyunwrap/analytics/benchmark.py with run_hybrid_benchmark_suite
+  and generate_regime_report: compares classical-only, learned-only, and
+  hybrid results per scene, with an explicit winner per scene
+  ("classical"/"learned"/"hybrid"/"inconclusive" when methods are within
+  5% of each other) -- never a single aggregate score, and the report
+  explicitly states it does not claim universal superiority.
+
+CLI
+- pyunwrap-train gains --use-curriculum-replay, --smoothness-weight, and
+  --real-data-path (builds datasets from a real stack via Strategy 1
+  instead of requiring pre-built HDF5 files).
+- New entry point pyunwrap-unwrap (pyunwrap.inference.hybrid:main) runs
+  hybrid or learned-only inference from the command line.
+- All new flags verified via real end-to-end CLI invocations, not just
+  argument parsing.
+
+Docs
+- README, CHANGELOG, and the full Sphinx docs site (landing page,
+  Project status, API reference for the three new modules) all reframed
+  consistently around the hybrid goal -- checked for stale "beat SNAPHU
+  everywhere" framing across the whole docs site, not just the README.
+- Fixed several RST docstring formatting warnings in the new modules
+  along the way.
+
+235 -> 242 total tests, all passing; ruff/black/mypy clean; docs build
+clean (3 expected network-only warnings, unchanged from before this
+commit). Verified against a freshly extracted copy of the packaged
+output, not just the working tree.
