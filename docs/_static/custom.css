@@ -1,7 +1,9 @@
-/* Small, deliberate tweaks on top of the furo theme -- not a redesign. */
+/* Small, deliberate tweaks on top of the sphinx_rtd_theme -- not a redesign. */
 
-/* Give the sidebar logo a bit of breathing room. */
-.sidebar-logo {
+/* Give the sidebar logo a bit of breathing room (RTD theme's logo lives
+   inside the side-nav search block, not a dedicated .sidebar-logo class
+   like Furo used). */
+.wy-side-nav-search img.logo {
   max-width: 72px;
   margin: 1rem auto 0.5rem auto;
 }
@@ -12,6 +14,6 @@
 }
 
 /* Nyquist/phase equations read better with a touch more line height. */
-article p, article li {
+article p, article li, .rst-content p, .rst-content li {
   line-height: 1.6;
 }

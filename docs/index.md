@@ -115,11 +115,33 @@ SNAPHU.
 ```{toctree}
 :maxdepth: 2
 :hidden:
+:caption: Getting Started
 
 installation
 quickstart
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: How It Works
+
 architecture
+```
+
+```{toctree}
+:maxdepth: 1
+:hidden:
+:caption: Tutorials
+
 tutorials/index
+```
+
+```{toctree}
+:maxdepth: 1
+:hidden:
+:caption: Reference
+
 experiments
 api/index
 ```

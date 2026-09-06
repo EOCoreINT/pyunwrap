@@ -9,6 +9,14 @@ once it reaches `1.0`.
 ## [Unreleased]
 
 ### Changed
+- **Docs theme switched from Furo to `sphinx_rtd_theme`**, and the sidebar
+  navigation reorganized into named, grouped sections (Getting Started,
+  How It Works, Tutorials, Reference, Project) -- matching the sibling
+  EOCoreINT/pygeofetch project's documentation site for a consistent look
+  across the org's projects. Verified by actually fetching pygeofetch's
+  live docs site and comparing structure, not assumed from memory.
+  `docs/_static/custom.css` updated to target the new theme's actual CSS
+  classes (Furo's `.sidebar-logo` doesn't exist under this theme).
 - **Project goal reframed to a hybrid, regime-aware unwrapper**, directly
   from this project's own benchmark evidence: `pyunwrap` beats SNAPHU
   reliably in exactly one regime (low-coherence decorrelation) and loses
@@ -364,7 +372,7 @@ once it reaches `1.0`.
   `PhaseUnwrapper.unwrap`, since the exported graph's shape-mismatch safety
   net is a data-dependent branch that isn't captured for tile sizes not
   divisible by the encoder's stride.
-- Report generator: the  "Training history" section's chart asset was being
+- Report generator: the "Training history" section's chart asset was being
   generated but never actually embedded in the report template.
 - `Trainer.Visualizer` and `pyunwrap.visualization.maps` were calling
   `matplotlib.use("Agg")` to force headless rendering for saved PNGs. This
