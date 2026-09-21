@@ -30,6 +30,10 @@
 
 ---
 
+# ⚠️ Work In Progress (Pre-Alpha)
+This repository is currently an active R&D playground as part of my pre-Master's roadmap for the Copernicus Master in Digital Earth. Architecture is shifting rapidly. 
+
+
 `pyunwrap` unwraps Interferometric Synthetic Aperture Radar (InSAR) phase —
 the core measurement behind satellite-based ground-deformation monitoring.
 It is **not** a claim to replace classical unwrapping (SNAPHU) everywhere —
