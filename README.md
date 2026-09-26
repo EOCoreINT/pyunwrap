@@ -31,7 +31,7 @@
 ---
 
 # ⚠️ Work In Progress (Pre-Alpha)
-This repository is currently an active R&D playground as part of my pre-Master's roadmap for the Copernicus Master in Digital Earth. Architecture is shifting rapidly. 
+This repository is currently an active research and development (R&D) playground as part of my pre-Master's roadmap for the Copernicus Master in Digital Earth. Architecture is shifting rapidly. 
 
 
 `pyunwrap` unwraps Interferometric Synthetic Aperture Radar (InSAR) phase —
